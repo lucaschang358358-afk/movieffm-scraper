@@ -3,9 +3,9 @@ const axios = require("axios");
 
 const builder = new addonBuilder({
     id: "org.lucas.movieffmscraper",
-    version: "1.0.8",
-    name: "MovieFFM 直連外掛 (長效直闖版)",
-    description: "延長連線等待時間，給予隱藏瀏覽器足夠時間破解 Cloudflare",
+    version: "1.0.9",
+    name: "MovieFFM 直連外掛 (暴力盲狙版)",
+    description: "跳過網頁載入，直接模擬播放按鈕打 API 獲取資源",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
@@ -17,11 +17,11 @@ const baseHeaders = {
     "Referer": "https://www.mvffm.net/"
 };
 
-// 核心連線函數，將超時放寬至 30 秒
+// 核心連線函數，超時設為 15 秒
 async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
     const config = {
         method: method,
-        timeout: 30000, // 30秒：給足 Cloudflare 驗證與瀏覽器渲染的時間
+        timeout: 15000, 
         data: payload,
         headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders
     };
@@ -36,8 +36,8 @@ async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
         api_key: process.env.SCRAPER_API_KEY,
         url: targetUrl,
         keep_headers: "true",
-        premium: "true",
-        render: "true" // 遠端渲染會比較花時間
+        premium: "true" 
+        // 拿掉 render: true，因為我們不讀網頁了，直接打 API 速度更快
     };
     return axios(config);
 }
@@ -48,38 +48,35 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         console.log(`\n[1] 收到 Nuvio 請求，IMDB ID: ${id}`);
         
-        // 1. 直接從官方庫獲取英文原名
-        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`, { timeout: 3000 });
-        const englishTitle = metaRes.data?.meta?.name;
+        // 1. 取得中英文片名
+        let tmdbTitle = "";
+        let cinemetaTitle = "";
 
-        if (!englishTitle) throw new Error("無法取得英文片名，無法組合網址");
-
-        // 2. 將英文片名轉為網址 Slug
-        const slug = englishTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-        const directUrl = `https://www.mvffm.net/movies/${slug}/`;
-        
-        console.log(`[2] 放棄搜尋，直接闖入專屬網址: ${directUrl}`);
-
-        // 3. 進入專屬網頁抓取隱藏的 post_id (這裡最多會等 30 秒)
-        const htmlRes = await fetchViaScraper(directUrl, "GET");
-        const html = htmlRes.data || "";
-        const postIdMatch = html.match(/(?:id="post-|postid-|data-post=")(\d+)/);
-
-        if (!postIdMatch) {
-            console.log("[警告] 闖門失敗，該網址不存在此電影，或仍被 Cloudflare 阻擋。");
-            return { streams: [] };
+        if (process.env.TMDB_API_KEY) {
+            const tmdbUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${process.env.TMDB_API_KEY}&external_source=imdb_id&language=zh-TW`;
+            const tmdbRes = await axios.get(tmdbUrl, { timeout: 3000 }).catch(() => null);
+            tmdbTitle = tmdbRes?.data?.movie_results?.[0]?.title || "";
         }
         
-        const postId = postIdMatch[1];
-        console.log(`[3] 闖關成功！挖出內部 post_id: ${postId}`);
+        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`, { timeout: 3000 }).catch(() => null);
+        cinemetaTitle = metaRes?.data?.meta?.name || "";
 
-        // 4. 打包行李，用 post_id 去後台換取影片
+        if (!tmdbTitle && !cinemetaTitle) throw new Error("無法解析電影名稱");
+
+        const searchKeyword = tmdbTitle || cinemetaTitle;
+        console.log(`[2] 鎖定目標片名: ${searchKeyword}`);
+
+        // 3. 暴力盲狙：不進網頁找 ID 了！直接假裝是播放按鈕，向 admin-ajax.php 要資源
+        // 利用 Dooplay 主題的特性，我們可以嘗試用標題去搜刮 live_search 或是直接帶入參數
         const ajaxTargetUrl = "https://www.mvffm.net/wp-admin/admin-ajax.php";
-        const ajaxPayload = `action=doo_player_ajax&post=${postId}&nume=1&type=movie`;
-        console.log(`[4] 發送 API 請求索取影片...`);
+        
+        // 這邊組合了幾種常見的盲狙參數，利用標題去撞出 iframe
+        const ajaxPayload = `action=doo_player_ajax&post=${encodeURIComponent(searchKeyword)}&nume=1&type=movie`;
+        
+        console.log(`[3] 繞過網頁載入，直接向 API 討影片...`);
         const ajaxRes = await fetchViaScraper(ajaxTargetUrl, "POST", ajaxPayload);
 
-        // 5. 提取 m3u8 網址
+        // 4. 解析回傳的 m3u8
         let streamUrl = "";
         const responseData = typeof ajaxRes.data === 'string' ? ajaxRes.data : JSON.stringify(ajaxRes.data);
         
@@ -90,21 +87,21 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const iframeMatch = responseData.match(/src=["']?\\?(https?:\/\/[^"'\\]+)["']?/);
             if (iframeMatch) {
                 let iframeUrl = iframeMatch[1].replace(/\\\//g, '/');
-                console.log(`[5] 發現隱藏 iframe: ${iframeUrl}`);
+                console.log(`[4] 發現隱藏 iframe: ${iframeUrl}`);
                 const iframeRes = await fetchViaScraper(iframeUrl, "GET");
                 const deepM3u8 = iframeRes.data.match(/(https?:\/\/[^"'\s]+\.m3u8)/);
                 if (deepM3u8) streamUrl = deepM3u8[1];
             }
         }
 
-        if (!streamUrl) throw new Error("影片解析失敗");
-        console.log(`[6] 大功告成！取得片源: ${streamUrl}`);
+        if (!streamUrl) throw new Error("盲狙失敗，API 未回傳有效的影片網址");
+        console.log(`[5] 成功取得片源: ${streamUrl}`);
 
         return {
             streams: [
                 {
                     url: streamUrl,
-                    title: `MovieFFM 直連\n(長效直闖)`,
+                    title: `MovieFFM 直連\n(暴力盲狙版)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
