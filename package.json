@@ -1,0 +1,13 @@
+{
+  "name": "movieffm-scraper",
+  "version": "1.0.0",
+  "description": "Nuvio HTTP Addon for MovieFFM",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "stremio-addon-sdk": "^1.1.10"
+  }
+}
