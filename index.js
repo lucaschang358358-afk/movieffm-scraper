@@ -3,9 +3,9 @@ const axios = require("axios");
 
 const builder = new addonBuilder({
     id: "org.lucas.movieffmscraper",
-    version: "1.0.3",
-    name: "MovieFFM 直連外掛 (雙重搜尋版)",
-    description: "自動轉換中文片名，若失敗則退回英文搜尋，並透過 Scraper API 繞過防護",
+    version: "1.0.4",
+    name: "MovieFFM 直連外掛 (渲染突破版)",
+    description: "加入 render 參數，強制 Scraper API 執行 JS 來破解 Cloudflare 驗證盾",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
@@ -28,24 +28,31 @@ async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
             api_key: process.env.SCRAPER_API_KEY,
             url: targetUrl,
             keep_headers: "true",
-            premium: "true"
+            premium: "true",
+            render: "true" // 關鍵武器：強制開啟隱藏瀏覽器，等待 JS 跑完、通過 Cloudflare 盾
         },
         data: payload,
         headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders
     });
 }
 
-// 輔助函數：執行搜尋並挖出 post_id
+// 輔助函數：執行搜尋並挖出 post_id，加入超強 Debug 功能
 async function searchMovieAndGetPostId(title) {
-    console.log(`準備搜尋片名: ${title}`);
+    console.log(`[搜尋] 準備發送搜尋請求: ${title}`);
     const searchTargetUrl = `https://www.mvffm.net/?s=${encodeURIComponent(title)}`;
     const searchRes = await fetchViaScraper(searchTargetUrl, "GET");
     
-    const postIdMatch = searchRes.data.match(/id="post-(\d+)"/);
+    const html = searchRes.data || "";
+    const postIdMatch = html.match(/id="post-(\d+)"/);
+    
     if (postIdMatch) {
-        return postIdMatch[1]; // 成功找到 post_id
+        return postIdMatch[1];
+    } else {
+        // 如果找不到，就把 ScraperAPI 實際抓到的網頁開頭印出來，讓我們看是不是被驗證碼卡住
+        const snippet = typeof html === 'string' ? html.substring(0, 200).replace(/\n/g, '') : "非文字格式";
+        console.log(`[警告] 找不到 post_id！網站實際回傳的內容開頭是: ${snippet}...`);
+        return null;
     }
-    return null; // 找不到
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -57,43 +64,45 @@ builder.defineStreamHandler(async ({ type, id }) => {
         let tmdbTitle = "";
         let cinemetaTitle = "";
 
-        // 1. 取得 TMDB 中文譯名
         if (process.env.TMDB_API_KEY) {
             const tmdbUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${process.env.TMDB_API_KEY}&external_source=imdb_id&language=zh-TW`;
             const tmdbRes = await axios.get(tmdbUrl);
             tmdbTitle = tmdbRes.data.movie_results?.[0]?.title || tmdbRes.data.tv_results?.[0]?.name;
         }
         
-        // 2. 取得 Cinemeta 英文原名 (預設備案)
         const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`);
         cinemetaTitle = metaRes.data?.meta?.name;
 
         if (!tmdbTitle && !cinemetaTitle) throw new Error("無法解析電影名稱");
 
-        // --- 階段 B: 雙重搜尋保險 ---
         let postId = null;
         
         // 優先用中文搜
         if (tmdbTitle) {
-            console.log(`[2A] 優先使用中文搜尋...`);
+            console.log(`[2A] 優先使用中文搜尋: ${tmdbTitle}`);
             postId = await searchMovieAndGetPostId(tmdbTitle);
         }
 
         // 如果中文搜不到，退回用英文搜
         if (!postId && cinemetaTitle && cinemetaTitle !== tmdbTitle) {
-            console.log(`[2B] 中文搜不到，退回使用英文搜尋...`);
+            console.log(`[2B] 中文搜不到，退回使用英文搜尋: ${cinemetaTitle}`);
             postId = await searchMovieAndGetPostId(cinemetaTitle);
         }
 
-        if (!postId) throw new Error("中文與英文片名皆無法在網站上找到該電影");
+        // 最後備案：直接拿 IMDB ID 去搜 (有些 WordPress 主題支援這種搜法)
+        if (!postId) {
+            console.log(`[2C] 雙語皆失敗，嘗試直接搜尋 IMDB ID: ${id}`);
+            postId = await searchMovieAndGetPostId(id);
+        }
+
+        if (!postId) throw new Error("完全找不到該電影，請查看上方日誌回傳的網頁內容");
         console.log(`[3] 成功挖出內部 post_id: ${postId}`);
 
-        // --- 階段 C: 觸發 admin-ajax.php 取得影片資料 ---
         const ajaxTargetUrl = "https://www.mvffm.net/wp-admin/admin-ajax.php";
         const ajaxPayload = `action=doo_player_ajax&post=${postId}&nume=1&type=movie`;
+        console.log(`[4] 發送 API 請求索取影片...`);
         const ajaxRes = await fetchViaScraper(ajaxTargetUrl, "POST", ajaxPayload);
 
-        // --- 階段 D: 解析最終的 m3u8 直連網址 ---
         let streamUrl = "";
         const responseData = typeof ajaxRes.data === 'string' ? ajaxRes.data : JSON.stringify(ajaxRes.data);
         
@@ -104,7 +113,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const iframeMatch = responseData.match(/src=["']?\\?(https?:\/\/[^"'\\]+)["']?/);
             if (iframeMatch) {
                 let iframeUrl = iframeMatch[1].replace(/\\\//g, '/');
-                console.log(`[4] 發現隱藏的 iframe: ${iframeUrl}`);
+                console.log(`[5] 發現隱藏的 iframe: ${iframeUrl}`);
                 const iframeRes = await fetchViaScraper(iframeUrl, "GET");
                 const deepM3u8 = iframeRes.data.match(/(https?:\/\/[^"'\s]+\.m3u8)/);
                 if (deepM3u8) streamUrl = deepM3u8[1];
@@ -112,13 +121,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
 
         if (!streamUrl) throw new Error("無法提取最終播放網址");
-        console.log(`[5] 成功繞過防護，取得片源: ${streamUrl}`);
+        console.log(`[6] 成功取得片源: ${streamUrl}`);
 
         return {
             streams: [
                 {
                     url: streamUrl,
-                    title: `MovieFFM 直連\n(雙重搜尋成功)`,
+                    title: `MovieFFM 直連\n(完美渲染版)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
