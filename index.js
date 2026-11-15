@@ -3,9 +3,9 @@ const axios = require("axios");
 
 const builder = new addonBuilder({
     id: "org.lucas.movieffmscraper",
-    version: "1.0.7",
-    name: "MovieFFM 直連外掛 (極速直闖版)",
-    description: "放棄無效搜尋，直接透過網址規律闖入門禁抓取資源",
+    version: "1.0.8",
+    name: "MovieFFM 直連外掛 (長效直闖版)",
+    description: "延長連線等待時間，給予隱藏瀏覽器足夠時間破解 Cloudflare",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
@@ -17,11 +17,11 @@ const baseHeaders = {
     "Referer": "https://www.mvffm.net/"
 };
 
-// 核心連線函數，加入超時防卡死機制
+// 核心連線函數，將超時放寬至 30 秒
 async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
     const config = {
         method: method,
-        timeout: 8000, // 8秒沒抓到就果斷放棄，保證 Nuvio 不卡死
+        timeout: 30000, // 30秒：給足 Cloudflare 驗證與瀏覽器渲染的時間
         data: payload,
         headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders
     };
@@ -37,7 +37,7 @@ async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
         url: targetUrl,
         keep_headers: "true",
         premium: "true",
-        render: "true"
+        render: "true" // 遠端渲染會比較花時間
     };
     return axios(config);
 }
@@ -48,25 +48,25 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         console.log(`\n[1] 收到 Nuvio 請求，IMDB ID: ${id}`);
         
-        // 1. 直接從官方庫獲取英文原名 (因為網址格式都是英文)
+        // 1. 直接從官方庫獲取英文原名
         const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`, { timeout: 3000 });
         const englishTitle = metaRes.data?.meta?.name;
 
         if (!englishTitle) throw new Error("無法取得英文片名，無法組合網址");
 
-        // 2. 將英文片名轉為網址 Slug (例如 "Lovesick" -> "lovesick", "Spider-Man" -> "spider-man")
+        // 2. 將英文片名轉為網址 Slug
         const slug = englishTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
         const directUrl = `https://www.mvffm.net/movies/${slug}/`;
         
         console.log(`[2] 放棄搜尋，直接闖入專屬網址: ${directUrl}`);
 
-        // 3. 進入專屬網頁抓取隱藏的 post_id
+        // 3. 進入專屬網頁抓取隱藏的 post_id (這裡最多會等 30 秒)
         const htmlRes = await fetchViaScraper(directUrl, "GET");
         const html = htmlRes.data || "";
         const postIdMatch = html.match(/(?:id="post-|postid-|data-post=")(\d+)/);
 
         if (!postIdMatch) {
-            console.log("[警告] 闖門失敗，該網址不存在此電影，或已被 Cloudflare 阻擋。");
+            console.log("[警告] 闖門失敗，該網址不存在此電影，或仍被 Cloudflare 阻擋。");
             return { streams: [] };
         }
         
@@ -104,14 +104,14 @@ builder.defineStreamHandler(async ({ type, id }) => {
             streams: [
                 {
                     url: streamUrl,
-                    title: `MovieFFM 直連\n(極速直闖)`,
+                    title: `MovieFFM 直連\n(長效直闖)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
         };
     } catch (error) {
         console.error("抓取失敗或連線超時:", error.message);
-        return { streams: [] }; // 發生錯誤立刻返回空清單，保證 Nuvio 不卡死
+        return { streams: [] };
     }
 });
 
