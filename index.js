@@ -3,9 +3,9 @@ const axios = require("axios");
 
 const builder = new addonBuilder({
     id: "org.lucas.ncatscraper",
-    version: "1.0.3",
-    name: "網飞貓 (NCat) 直連外掛 (極速直擊版)",
-    description: "透過極速無渲染模式直接向 ncat21.com 索取 m3u8 影片源",
+    version: "1.0.4",
+    name: "網飞貓 (NCat) 本機直連外掛",
+    description: "完全捨棄跳板，利用本機真實網路直接向 ncat21.com 索取資源",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
@@ -16,35 +16,6 @@ const baseHeaders = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.ncat21.com/"
 };
-
-// 極速連線函數：拿掉 render，用純 API 請求拼速度
-async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
-    const config = {
-        method: method,
-        timeout: 35000, 
-        data: payload,
-        headers: baseHeaders
-    };
-
-    if (process.env.SCRAPER_API_KEY) {
-        config.url = "http://api.scraperapi.com";
-        config.params = {
-            api_key: process.env.SCRAPER_API_KEY,
-            url: targetUrl,
-            keep_headers: "true",
-            premium: "true"
-            // 不開 render，避免雲端瀏覽器拖慢幾十秒
-        };
-    } else {
-        config.url = targetUrl;
-    }
-
-    const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("強制逾時：連線過久")), 36000)
-    );
-
-    return Promise.race([axios(config), timeoutPromise]);
-}
 
 builder.defineStreamHandler(async ({ type, id }) => {
     if (type !== "movie") return { streams: [] };
@@ -67,15 +38,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
         if (!tmdbTitle && !cinemetaTitle) throw new Error("無法解析電影名稱");
         
         const searchKeyword = tmdbTitle || cinemetaTitle;
-        console.log(`[2] 準備在網飛貓極速搜尋: ${searchKeyword}`);
+        console.log(`[2] 本機直接搜尋: ${searchKeyword}`);
 
-        // --- 階段 B: 搜尋並獲取播放頁面網址 ---
+        // --- 階段 A: 本機直接打搜尋 ---
         const searchUrl = `https://www.ncat21.com/search?k=${encodeURIComponent(searchKeyword)}`;
-        const searchRes = await fetchViaScraper(searchUrl, "GET");
+        const searchRes = await axios.get(searchUrl, { headers: baseHeaders, timeout: 10000 });
         
         const html = searchRes.data || "";
-        
-        // 抓取 /detail/數字.html 或 /detail/2/數字.html
         const detailUrlMatch = html.match(/href="(\/detail\/[^"]+\.html)"/i) || html.match(/href="(\/play\/[^"]+\.html)"/i);
         
         if (!detailUrlMatch) {
@@ -85,14 +54,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
         
         const detailPath = detailUrlMatch[1];
         const fullDetailUrl = `https://www.ncat21.com${detailPath}`;
-        console.log(`[3] 成功鎖定專屬頁面: ${fullDetailUrl}`);
+        console.log(`[3] 鎖定詳情頁: ${fullDetailUrl}`);
 
-        // --- 階段 C: 進入專屬頁面，直接挖 m3u8 ---
-        console.log(`[4] 抓取詳情頁原始碼中...`);
-        const detailRes = await fetchViaScraper(fullDetailUrl, "GET");
+        // --- 階段 B: 進入詳情頁挖 m3u8 ---
+        const detailRes = await axios.get(fullDetailUrl, { headers: baseHeaders, timeout: 10000 });
         const detailHtml = detailRes.data || "";
         
-        // 直接用正則表達式把 m3u8 抓出來
         const m3u8Match = detailHtml.match(/src:\s*"(https?:\/\/[^"]+\.m3u8)"/i) || detailHtml.match(/(https?:\/\/[^"'\s\\]+\.m3u8)/i);
         
         if (!m3u8Match) {
@@ -100,13 +67,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
         
         const streamUrl = m3u8Match[1].replace(/\\\//g, '/');
-        console.log(`[5] 成功抓取網飛貓片源: ${streamUrl}`);
+        console.log(`[4] 成功抓取本機直連片源: ${streamUrl}`);
 
         return {
             streams: [
                 {
                     url: streamUrl,
-                    title: `網飛貓 直連\n(極速直擊)`,
+                    title: `網飛貓 直連\n(本機秒播)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
@@ -119,4 +86,4 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: port });
-console.log(`網飛貓外掛已啟動於 Port ${port}`);
+console.log(`本機網飛貓外掛已啟動於 Port ${port}`);
