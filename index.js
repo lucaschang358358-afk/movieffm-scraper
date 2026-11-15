@@ -3,44 +3,49 @@ const axios = require("axios");
 
 const builder = new addonBuilder({
     id: "org.lucas.movieffmscraper",
-    version: "1.0.1",
-    name: "MovieFFM 直連外掛 (突破防護)",
-    description: "自動轉換中文片名並透過 Scraper API 繞過 Cloudflare 抓取片源",
+    version: "1.0.3",
+    name: "MovieFFM 直連外掛 (雙重搜尋版)",
+    description: "自動轉換中文片名，若失敗則退回英文搜尋，並透過 Scraper API 繞過防護",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
     idPrefixes: ["tt"]
 });
 
-// 模擬瀏覽器的基本標頭
 const baseHeaders = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.mvffm.net/"
 };
 
-// 核心函數：負責將請求轉發給 Scraper API 繞過防護
 async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
     if (!process.env.SCRAPER_API_KEY) {
-        // 若未設定 API Key，則直接連線 (適合在本地端測試時使用)
-        return axios({ 
-            method: method, 
-            url: targetUrl, 
-            data: payload, 
-            headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders 
-        });
+        return axios({ method, url: targetUrl, data: payload, headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders });
     }
-
-    // 透過 Scraper API 代理發送請求 (以標準 ScraperAPI 格式為例)
     return axios({
         method: method,
         url: "http://api.scraperapi.com",
         params: {
             api_key: process.env.SCRAPER_API_KEY,
-            url: targetUrl
+            url: targetUrl,
+            keep_headers: "true",
+            premium: "true"
         },
         data: payload,
         headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders
     });
+}
+
+// 輔助函數：執行搜尋並挖出 post_id
+async function searchMovieAndGetPostId(title) {
+    console.log(`準備搜尋片名: ${title}`);
+    const searchTargetUrl = `https://www.mvffm.net/?s=${encodeURIComponent(title)}`;
+    const searchRes = await fetchViaScraper(searchTargetUrl, "GET");
+    
+    const postIdMatch = searchRes.data.match(/id="post-(\d+)"/);
+    if (postIdMatch) {
+        return postIdMatch[1]; // 成功找到 post_id
+    }
+    return null; // 找不到
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -49,28 +54,38 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         console.log(`\n[1] 收到 Nuvio 請求，IMDB ID: ${id}`);
         
-        // --- 階段 A: 解決片名語言問題 (英文轉中文) ---
-        let movieTitle = "";
+        let tmdbTitle = "";
+        let cinemetaTitle = "";
+
+        // 1. 取得 TMDB 中文譯名
         if (process.env.TMDB_API_KEY) {
             const tmdbUrl = `https://api.themoviedb.org/3/find/${id}?api_key=${process.env.TMDB_API_KEY}&external_source=imdb_id&language=zh-TW`;
             const tmdbRes = await axios.get(tmdbUrl);
-            movieTitle = tmdbRes.data.movie_results?.[0]?.title || tmdbRes.data.tv_results?.[0]?.name;
+            tmdbTitle = tmdbRes.data.movie_results?.[0]?.title || tmdbRes.data.tv_results?.[0]?.name;
         }
         
-        if (!movieTitle) {
-            const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`);
-            movieTitle = metaRes.data?.meta?.name;
-        }
-        if (!movieTitle) throw new Error("無法解析電影名稱");
-        console.log(`[2] 準備搜尋中文片名: ${movieTitle}`);
+        // 2. 取得 Cinemeta 英文原名 (預設備案)
+        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`);
+        cinemetaTitle = metaRes.data?.meta?.name;
 
-        // --- 階段 B: 解決 Cloudflare 403 封鎖 (透過代理搜尋) ---
-        const searchTargetUrl = `https://www.mvffm.net/?s=${encodeURIComponent(movieTitle)}`;
-        const searchRes = await fetchViaScraper(searchTargetUrl, "GET");
+        if (!tmdbTitle && !cinemetaTitle) throw new Error("無法解析電影名稱");
+
+        // --- 階段 B: 雙重搜尋保險 ---
+        let postId = null;
         
-        const postIdMatch = searchRes.data.match(/id="post-(\d+)"/);
-        if (!postIdMatch) throw new Error("網站上找不到這部電影");
-        const postId = postIdMatch[1];
+        // 優先用中文搜
+        if (tmdbTitle) {
+            console.log(`[2A] 優先使用中文搜尋...`);
+            postId = await searchMovieAndGetPostId(tmdbTitle);
+        }
+
+        // 如果中文搜不到，退回用英文搜
+        if (!postId && cinemetaTitle && cinemetaTitle !== tmdbTitle) {
+            console.log(`[2B] 中文搜不到，退回使用英文搜尋...`);
+            postId = await searchMovieAndGetPostId(cinemetaTitle);
+        }
+
+        if (!postId) throw new Error("中文與英文片名皆無法在網站上找到該電影");
         console.log(`[3] 成功挖出內部 post_id: ${postId}`);
 
         // --- 階段 C: 觸發 admin-ajax.php 取得影片資料 ---
@@ -103,14 +118,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
             streams: [
                 {
                     url: streamUrl,
-                    title: `MovieFFM 直連\n(繞過防護成功)`,
+                    title: `MovieFFM 直連\n(雙重搜尋成功)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
         };
     } catch (error) {
-        // 印出詳細的錯誤資訊方便 Debug，例如是否還是回傳 403
-        console.error("抓取失敗:", error.response ? `Status: ${error.response.status}` : error.message);
+        console.error("抓取失敗:", error.message);
         return { streams: [] };
     }
 });
