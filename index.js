@@ -2,10 +2,10 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 
 const builder = new addonBuilder({
-    id: "org.lucas.movieffmscraper",
-    version: "1.0.9",
-    name: "MovieFFM 直連外掛 (暴力盲狙版)",
-    description: "跳過網頁載入，直接模擬播放按鈕打 API 獲取資源",
+    id: "org.lucas.ncatscraper",
+    version: "1.0.1",
+    name: "網飞貓 (NCat) 直連外掛",
+    description: "自動從 ncat21.com 搜尋並刮取 m3u8 高清片源",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
@@ -14,16 +14,16 @@ const builder = new addonBuilder({
 
 const baseHeaders = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.mvffm.net/"
+    "Referer": "https://www.ncat21.com/"
 };
 
-// 核心連線函數，超時設為 15 秒
+// 代理連線函數 (網飛貓通常不擋家用 IP，但 Render 雲端 IP 容易被擋，所以還是掛著 Scraper)
 async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
     const config = {
         method: method,
         timeout: 15000, 
         data: payload,
-        headers: payload ? { "Content-Type": "application/x-www-form-urlencoded", ...baseHeaders } : baseHeaders
+        headers: baseHeaders
     };
 
     if (!process.env.SCRAPER_API_KEY) {
@@ -36,8 +36,7 @@ async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
         api_key: process.env.SCRAPER_API_KEY,
         url: targetUrl,
         keep_headers: "true",
-        premium: "true" 
-        // 拿掉 render: true，因為我們不讀網頁了，直接打 API 速度更快
+        premium: "true"
     };
     return axios(config);
 }
@@ -48,7 +47,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         console.log(`\n[1] 收到 Nuvio 請求，IMDB ID: ${id}`);
         
-        // 1. 取得中英文片名
+        // --- 階段 A: 翻譯片名 ---
         let tmdbTitle = "";
         let cinemetaTitle = "";
 
@@ -62,56 +61,58 @@ builder.defineStreamHandler(async ({ type, id }) => {
         cinemetaTitle = metaRes?.data?.meta?.name || "";
 
         if (!tmdbTitle && !cinemetaTitle) throw new Error("無法解析電影名稱");
-
+        
         const searchKeyword = tmdbTitle || cinemetaTitle;
-        console.log(`[2] 鎖定目標片名: ${searchKeyword}`);
+        console.log(`[2] 準備在網飛貓搜尋: ${searchKeyword}`);
 
-        // 3. 暴力盲狙：不進網頁找 ID 了！直接假裝是播放按鈕，向 admin-ajax.php 要資源
-        // 利用 Dooplay 主題的特性，我們可以嘗試用標題去搜刮 live_search 或是直接帶入參數
-        const ajaxTargetUrl = "https://www.mvffm.net/wp-admin/admin-ajax.php";
+        // --- 階段 B: 搜尋並獲取播放頁面網址 ---
+        // 網飛貓的搜尋參數是 k
+        const searchUrl = `https://www.ncat21.com/search?k=${encodeURIComponent(searchKeyword)}`;
+        const searchRes = await fetchViaScraper(searchUrl, "GET");
         
-        // 這邊組合了幾種常見的盲狙參數，利用標題去撞出 iframe
-        const ajaxPayload = `action=doo_player_ajax&post=${encodeURIComponent(searchKeyword)}&nume=1&type=movie`;
+        const html = searchRes.data || "";
         
-        console.log(`[3] 繞過網頁載入，直接向 API 討影片...`);
-        const ajaxRes = await fetchViaScraper(ajaxTargetUrl, "POST", ajaxPayload);
-
-        // 4. 解析回傳的 m3u8
-        let streamUrl = "";
-        const responseData = typeof ajaxRes.data === 'string' ? ajaxRes.data : JSON.stringify(ajaxRes.data);
+        // 從搜尋結果挖出第一部電影的播放連結，通常是 /detail/2/2549.html 或 /play/xxxx.html
+        // 尋找類似 <a href="/detail/xxx.html" title="電影名稱"> 的標籤
+        const detailUrlMatch = html.match(/href="(\/detail\/[^"]+\.html)"/i) || html.match(/href="(\/play\/[^"]+\.html)"/i);
         
-        const m3u8Match = responseData.match(/(https?:\/\/[^"'\s\\]+\.m3u8)/);
-        if (m3u8Match) {
-            streamUrl = m3u8Match[1];
-        } else {
-            const iframeMatch = responseData.match(/src=["']?\\?(https?:\/\/[^"'\\]+)["']?/);
-            if (iframeMatch) {
-                let iframeUrl = iframeMatch[1].replace(/\\\//g, '/');
-                console.log(`[4] 發現隱藏 iframe: ${iframeUrl}`);
-                const iframeRes = await fetchViaScraper(iframeUrl, "GET");
-                const deepM3u8 = iframeRes.data.match(/(https?:\/\/[^"'\s]+\.m3u8)/);
-                if (deepM3u8) streamUrl = deepM3u8[1];
-            }
+        if (!detailUrlMatch) {
+            throw new Error(`在網飛貓找不到這部電影: ${searchKeyword}`);
         }
+        
+        const detailPath = detailUrlMatch[1];
+        const fullDetailUrl = `https://www.ncat21.com${detailPath}`;
+        console.log(`[3] 找到電影專屬頁面: ${fullDetailUrl}`);
 
-        if (!streamUrl) throw new Error("盲狙失敗，API 未回傳有效的影片網址");
-        console.log(`[5] 成功取得片源: ${streamUrl}`);
+        // --- 階段 C: 進入專屬頁面，直接挖 m3u8 ---
+        const detailRes = await fetchViaScraper(fullDetailUrl, "GET");
+        const detailHtml = detailRes.data || "";
+        
+        // 根據你提供的原始碼，網飛貓直接把網址寫在 src: "..." 裡面
+        const m3u8Match = detailHtml.match(/src:\s*"(https?:\/\/[^"]+\.m3u8)"/i) || detailHtml.match(/(https?:\/\/[^"'\s\\]+\.m3u8)/i);
+        
+        if (!m3u8Match) {
+            throw new Error("在播放頁面中找不到 m3u8 連結，可能是防護或格式變更");
+        }
+        
+        const streamUrl = m3u8Match[1].replace(/\\\//g, '/');
+        console.log(`[4] 成功扒出網飛貓片源: ${streamUrl}`);
 
         return {
             streams: [
                 {
                     url: streamUrl,
-                    title: `MovieFFM 直連\n(暴力盲狙版)`,
+                    title: `網飛貓 直連\n(無敵秒播)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
         };
     } catch (error) {
-        console.error("抓取失敗或連線超時:", error.message);
+        console.error("抓取失敗:", error.message);
         return { streams: [] };
     }
 });
 
 const port = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: port });
-console.log(`外掛已啟動於 Port ${port}`);
+console.log(`網飛貓外掛已啟動於 Port ${port}`);
