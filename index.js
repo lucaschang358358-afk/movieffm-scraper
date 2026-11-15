@@ -1,4 +1,3 @@
-require('dotenv').config();
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 
