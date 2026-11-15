@@ -3,9 +3,9 @@ const axios = require("axios");
 
 const builder = new addonBuilder({
     id: "org.lucas.ncatscraper",
-    version: "1.0.1",
-    name: "網飞貓 (NCat) 直連外掛",
-    description: "自動從 ncat21.com 搜尋並刮取 m3u8 高清片源",
+    version: "1.0.3",
+    name: "網飞貓 (NCat) 直連外掛 (極速直擊版)",
+    description: "透過極速無渲染模式直接向 ncat21.com 索取 m3u8 影片源",
     catalogs: [], 
     resources: ["stream"],
     types: ["movie"],
@@ -17,28 +17,33 @@ const baseHeaders = {
     "Referer": "https://www.ncat21.com/"
 };
 
-// 代理連線函數 (網飛貓通常不擋家用 IP，但 Render 雲端 IP 容易被擋，所以還是掛著 Scraper)
+// 極速連線函數：拿掉 render，用純 API 請求拼速度
 async function fetchViaScraper(targetUrl, method = "GET", payload = null) {
     const config = {
         method: method,
-        timeout: 15000, 
+        timeout: 35000, 
         data: payload,
         headers: baseHeaders
     };
 
-    if (!process.env.SCRAPER_API_KEY) {
+    if (process.env.SCRAPER_API_KEY) {
+        config.url = "http://api.scraperapi.com";
+        config.params = {
+            api_key: process.env.SCRAPER_API_KEY,
+            url: targetUrl,
+            keep_headers: "true",
+            premium: "true"
+            // 不開 render，避免雲端瀏覽器拖慢幾十秒
+        };
+    } else {
         config.url = targetUrl;
-        return axios(config);
     }
 
-    config.url = "http://api.scraperapi.com";
-    config.params = {
-        api_key: process.env.SCRAPER_API_KEY,
-        url: targetUrl,
-        keep_headers: "true",
-        premium: "true"
-    };
-    return axios(config);
+    const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("強制逾時：連線過久")), 36000)
+    );
+
+    return Promise.race([axios(config), timeoutPromise]);
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -47,7 +52,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         console.log(`\n[1] 收到 Nuvio 請求，IMDB ID: ${id}`);
         
-        // --- 階段 A: 翻譯片名 ---
         let tmdbTitle = "";
         let cinemetaTitle = "";
 
@@ -63,46 +67,46 @@ builder.defineStreamHandler(async ({ type, id }) => {
         if (!tmdbTitle && !cinemetaTitle) throw new Error("無法解析電影名稱");
         
         const searchKeyword = tmdbTitle || cinemetaTitle;
-        console.log(`[2] 準備在網飛貓搜尋: ${searchKeyword}`);
+        console.log(`[2] 準備在網飛貓極速搜尋: ${searchKeyword}`);
 
         // --- 階段 B: 搜尋並獲取播放頁面網址 ---
-        // 網飛貓的搜尋參數是 k
         const searchUrl = `https://www.ncat21.com/search?k=${encodeURIComponent(searchKeyword)}`;
         const searchRes = await fetchViaScraper(searchUrl, "GET");
         
         const html = searchRes.data || "";
         
-        // 從搜尋結果挖出第一部電影的播放連結，通常是 /detail/2/2549.html 或 /play/xxxx.html
-        // 尋找類似 <a href="/detail/xxx.html" title="電影名稱"> 的標籤
+        // 抓取 /detail/數字.html 或 /detail/2/數字.html
         const detailUrlMatch = html.match(/href="(\/detail\/[^"]+\.html)"/i) || html.match(/href="(\/play\/[^"]+\.html)"/i);
         
         if (!detailUrlMatch) {
-            throw new Error(`在網飛貓找不到這部電影: ${searchKeyword}`);
+            console.log(`[警告] 找不到該電影的詳情頁連結`);
+            return { streams: [] };
         }
         
         const detailPath = detailUrlMatch[1];
         const fullDetailUrl = `https://www.ncat21.com${detailPath}`;
-        console.log(`[3] 找到電影專屬頁面: ${fullDetailUrl}`);
+        console.log(`[3] 成功鎖定專屬頁面: ${fullDetailUrl}`);
 
         // --- 階段 C: 進入專屬頁面，直接挖 m3u8 ---
+        console.log(`[4] 抓取詳情頁原始碼中...`);
         const detailRes = await fetchViaScraper(fullDetailUrl, "GET");
         const detailHtml = detailRes.data || "";
         
-        // 根據你提供的原始碼，網飛貓直接把網址寫在 src: "..." 裡面
+        // 直接用正則表達式把 m3u8 抓出來
         const m3u8Match = detailHtml.match(/src:\s*"(https?:\/\/[^"]+\.m3u8)"/i) || detailHtml.match(/(https?:\/\/[^"'\s\\]+\.m3u8)/i);
         
         if (!m3u8Match) {
-            throw new Error("在播放頁面中找不到 m3u8 連結，可能是防護或格式變更");
+            throw new Error("頁面中未找到 m3u8 影片源");
         }
         
         const streamUrl = m3u8Match[1].replace(/\\\//g, '/');
-        console.log(`[4] 成功扒出網飛貓片源: ${streamUrl}`);
+        console.log(`[5] 成功抓取網飛貓片源: ${streamUrl}`);
 
         return {
             streams: [
                 {
                     url: streamUrl,
-                    title: `網飛貓 直連\n(無敵秒播)`,
+                    title: `網飛貓 直連\n(極速直擊)`,
                     behaviorHints: { notWebReady: false }
                 }
             ]
